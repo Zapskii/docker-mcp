@@ -162,4 +162,26 @@ describe('WebSocket /logs streaming', () => {
     expect(result.messages[0]).toContain('no such container: ghost-container');
     expect(result.closeCode).not.toBeNull();
   });
+
+  test('destroys the follow stream when the client disconnects before logs() resolves', async () => {
+    const port = await startServer();
+    const stream = new Readable({ read() {} });
+    const destroy = jest.spyOn(stream, 'destroy');
+    let resolveLogs;
+    mockDocker.getContainer.mockImplementation(() => ({
+      logs: jest.fn(() => new Promise(r => { resolveLogs = () => r(stream); }))
+    }));
+    mockDocker.modem.demuxStream.mockImplementation(pipeDemux);
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/logs/${FAKE_CID}`, { headers: { 'x-api-key': TEST_KEY } });
+    await new Promise((resolve, reject) => { ws.on('open', resolve); ws.on('error', reject); });
+    ws.close();
+    await new Promise(r => ws.on('close', r));
+    await new Promise(r => setTimeout(r, 20)); // let the server observe the close
+
+    resolveLogs();
+    await new Promise(r => setTimeout(r, 20));
+
+    expect(destroy).toHaveBeenCalled();
+  });
 });
