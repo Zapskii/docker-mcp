@@ -27,7 +27,9 @@ describe('docker_image_prune', () => {
 
   it('prunes all unused images when all=true', async () => {
     await handleMCPTool('docker_image_prune', { all: true });
-    expect(mockDocker.pruneImages).toHaveBeenCalledWith({});
+    expect(mockDocker.pruneImages).toHaveBeenCalledWith(
+      { filters: { dangling: ['false'] } }
+    );
   });
 });
 
@@ -57,6 +59,18 @@ describe('docker_stats', () => {
     });
     const result = await handleMCPTool('docker_stats', {});
     expect(result.content[0].text).toContain('1024.00MiB');
+  });
+
+  it('scales CPU% by online_cpus like docker stats', async () => {
+    mockDocker.getContainer.mockReturnValueOnce({
+      stats: jest.fn().mockResolvedValue({
+        cpu_stats:    { cpu_usage: { total_usage: 1000 }, system_cpu_usage: 10000, online_cpus: 4 },
+        precpu_stats: { cpu_usage: { total_usage: 900  }, system_cpu_usage: 9000 },
+        memory_stats: { usage: 104857600, limit: 1073741824 }
+      })
+    });
+    const result = await handleMCPTool('docker_stats', { id: 'mycontainer' });
+    expect(result.content[0].text).toContain('CPU: 40.00%');
   });
 });
 
@@ -107,13 +121,10 @@ describe('healthcheck params', () => {
     expect(cfg.Healthcheck).toBeUndefined();
   });
 
-  it('docker_container_update applies healthcheck', async () => {
-    const update = jest.fn().mockResolvedValue({});
-    mockDocker.getContainer.mockReturnValueOnce({ update });
-    await handleMCPTool('docker_container_update', { id: 'c1', healthcheck: { test: 'true', interval_s: 15 } });
-    expect(update).toHaveBeenCalledWith(expect.objectContaining({
-      Healthcheck: { Test: ['CMD-SHELL', 'true'], Interval: 15e9 }
-    }));
+  it('docker_container_update rejects healthcheck (the update API ignores it)', async () => {
+    await expect(handleMCPTool('docker_container_update', { id: 'c1', healthcheck: { test: 'true', interval_s: 15 } }))
+      .rejects.toThrow(/nothing to update/i);
+    expect(mockDocker.getContainer).not.toHaveBeenCalled();
   });
 
   it('container_update still errors when nothing is given', async () => {
@@ -125,7 +136,7 @@ describe('healthcheck params', () => {
     expect(run.properties.healthcheck).toBeDefined();
     expect(run.properties.healthcheck.properties.test).toBeDefined();
     const upd = MCP_TOOLS.find(x => x.name === 'docker_container_update').inputSchema;
-    expect(upd.properties.healthcheck).toBeDefined();
+    expect(upd.properties.healthcheck).toBeUndefined();
   });
 });
 
@@ -138,6 +149,13 @@ describe('docker_run pull option', () => {
   it('pulls by default when pull is not specified', async () => {
     await handleMCPTool('docker_run', { image: 'nginx' });
     expect(mockDocker.pull).toHaveBeenCalledWith('nginx', expect.any(Function));
+  });
+
+  it('returns a job_id for mode=async instead of starting synchronously', async () => {
+    const result = await handleMCPTool('docker_run', { image: 'nginx', pull: false, mode: 'async' });
+    const data = JSON.parse(result.content[0].text);
+    expect(data.job_id).toBeDefined();
+    expect(data.type).toBe('run');
   });
 
   it('passes stored registry creds as authconfig when pre-pulling', async () => {

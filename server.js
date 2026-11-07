@@ -773,18 +773,7 @@ const MCP_TOOLS = [
         memory: { type: 'number', description: 'Memory limit in bytes' },
         memorySwap: { type: 'number', description: 'Total memory+swap limit in bytes (-1 = unlimited)' },
         memoryReservation: { type: 'number', description: 'Soft memory limit in bytes' },
-        pidsLimit: { type: 'number', description: 'Max number of processes (-1 = unlimited)' },
-        healthcheck: {
-          type: 'object',
-          description: 'Replace the container healthcheck (usable with docker_wait condition=healthy and recreate rollback)',
-          properties: {
-            test: { type: ['string', 'array'], description: 'Shell command string (wrapped in CMD-SHELL) or exec-form array, e.g. "curl -f http://localhost/"' },
-            interval_s: { type: 'number', description: 'Seconds between checks' },
-            timeout_s: { type: 'number', description: 'Seconds before a single check counts as failed' },
-            retries: { type: 'integer', description: 'Consecutive failures before unhealthy' },
-            start_period_s: { type: 'number', description: 'Grace period before failures count toward retries' }
-          }
-        }
+        pidsLimit: { type: 'number', description: 'Max number of processes (-1 = unlimited)' }
       },
       required: ['id']
     }
@@ -1322,30 +1311,35 @@ async function handleMCPTool(name, args) {
     }
 
     case 'docker_run': {
-      if (args.pull !== false) await pullImage(args.image);
-      const container = await docker.createContainer({
-        Image: args.image,
-        Cmd: normalizeCommand(args.command),
-        name: args.name,
-        Healthcheck: parseHealthcheck(args.healthcheck),
-        ExposedPorts: args.ports ? Object.fromEntries(
-          Object.values(args.ports).map(c => [`${c}/tcp`, {}])
-        ) : undefined,
-        HostConfig: {
-          PortBindings: args.ports ? Object.fromEntries(
-            Object.entries(args.ports).map(([h, c]) => [
-              `${c}/tcp`, [{ HostPort: h }]
-            ])
+      const doRun = async (job, signal) => {
+        if (args.pull !== false) await pullImage(args.image, job, signal);
+        const container = await docker.createContainer({
+          Image: args.image,
+          Cmd: normalizeCommand(args.command),
+          name: args.name,
+          Healthcheck: parseHealthcheck(args.healthcheck),
+          ExposedPorts: args.ports ? Object.fromEntries(
+            Object.values(args.ports).map(c => [`${c}/tcp`, {}])
           ) : undefined,
-          Binds: args.volumes || [],
-          RestartPolicy: parseRestartPolicy(args.restartPolicy, args.maximumRetryCount)
-        },
-        Env: args.env ? Object.entries(args.env).map(([k, v]) => `${k}=${v}`) : undefined
-      });
-      await container.start();
-      return {
-        content: [{ type: 'text', text: `Started container: ${container.id.substring(0, 12)}` }]
+          HostConfig: {
+            PortBindings: args.ports ? Object.fromEntries(
+              Object.entries(args.ports).map(([h, c]) => [
+                `${c}/tcp`, [{ HostPort: h }]
+              ])
+            ) : undefined,
+            Binds: args.volumes || [],
+            RestartPolicy: parseRestartPolicy(args.restartPolicy, args.maximumRetryCount)
+          },
+          Env: args.env ? Object.entries(args.env).map(([k, v]) => `${k}=${v}`) : undefined
+        });
+        await container.start();
+        return `Started container: ${container.id.substring(0, 12)}`;
       };
+      if (args.mode === 'async') {
+        const started = await startJob('run', doRun);
+        return { content: [{ type: 'text', text: JSON.stringify(started, null, 2) }] };
+      }
+      return { content: [{ type: 'text', text: await doRun() }] };
     }
 
     case 'docker_stop': {
@@ -1577,12 +1571,17 @@ async function handleMCPTool(name, args) {
     }
 
     case 'docker_stats': {
+      // docker stats reports % of one core: scale by online_cpus
+      const cpuPct = s => {
+        const cpuDelta = s.cpu_stats.cpu_usage.total_usage - s.precpu_stats.cpu_usage.total_usage;
+        const systemDelta = s.cpu_stats.system_cpu_usage - s.precpu_stats.system_cpu_usage;
+        const cpus = s.cpu_stats.online_cpus || (s.cpu_stats.cpu_usage.percpu_usage || []).length || 1;
+        return systemDelta > 0 ? (cpuDelta / systemDelta * cpus * 100).toFixed(2) : '0.00';
+      };
       if (args.id) {
         const container = docker.getContainer(args.id);
         const stats = await container.stats({ stream: false });
-        const cpuDelta = stats.cpu_stats.cpu_usage.total_usage - stats.precpu_stats.cpu_usage.total_usage;
-        const systemDelta = stats.cpu_stats.system_cpu_usage - stats.precpu_stats.system_cpu_usage;
-        const cpuPercent = systemDelta > 0 ? ((cpuDelta / systemDelta) * 100).toFixed(2) : '0.00';
+        const cpuPercent = cpuPct(stats);
         const memUsage = (stats.memory_stats.usage / 1024 / 1024).toFixed(2);
         const memLimit = (stats.memory_stats.limit / 1024 / 1024).toFixed(2);
         return {
@@ -1596,9 +1595,7 @@ async function handleMCPTool(name, args) {
             try {
               const container = docker.getContainer(containerInfo.Id);
               const stats = await container.stats({ stream: false });
-              const cpuDelta = stats.cpu_stats.cpu_usage.total_usage - stats.precpu_stats.cpu_usage.total_usage;
-              const systemDelta = stats.cpu_stats.system_cpu_usage - stats.precpu_stats.system_cpu_usage;
-              const cpuPercent = systemDelta > 0 ? ((cpuDelta / systemDelta) * 100).toFixed(2) : '0.00';
+              const cpuPercent = cpuPct(stats);
               const memUsage = (stats.memory_stats.usage / 1024 / 1024).toFixed(2);
               const memLimit = (stats.memory_stats.limit / 1024 / 1024).toFixed(2);
               return `${name}\t${cpuPercent}%\t${memUsage}MiB / ${memLimit}MiB`;
@@ -1777,7 +1774,9 @@ async function handleMCPTool(name, args) {
           content: [{ type: 'text', text: JSON.stringify({ ImagesDeleted: deleted, Errors: errors }, null, 2) }]
         };
       }
-      const result = await docker.pruneImages(args.all ? {} : { filters: { dangling: { 'true': true } } });
+      const result = await docker.pruneImages(args.all
+        ? { filters: { dangling: ['false'] } }
+        : { filters: { dangling: { 'true': true } } });
       return {
         content: [{ type: 'text', text: `Pruned images:\n${JSON.stringify(result, null, 2)}` }]
       };
@@ -1848,8 +1847,6 @@ async function handleMCPTool(name, args) {
       const update = {};
       const policy = parseRestartPolicy(args.restartPolicy, args.maximumRetryCount);
       if (policy) update.RestartPolicy = policy;
-      const healthcheck = parseHealthcheck(args.healthcheck);
-      if (healthcheck) update.Healthcheck = healthcheck;
       for (const [argKey, field] of [
         ['nanoCpus', 'NanoCpus'], ['cpuShares', 'CpuShares'],
         ['cpuPeriod', 'CpuPeriod'], ['cpuQuota', 'CpuQuota'],
