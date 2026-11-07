@@ -999,7 +999,7 @@ const MCP_TOOLS = [
   },
 ];
 
-async function recreateRollback(old, name, newContainer, err, backupName) {
+async function recreateRollback(old, name, newContainer, err, backupName, wasRunning) {
   const notes = [];
   if (newContainer) {
     try { await newContainer.remove({ force: true }); notes.push('removed failed new container'); }
@@ -1007,8 +1007,10 @@ async function recreateRollback(old, name, newContainer, err, backupName) {
   }
   try { await old.rename({ name }); notes.push(`renamed backup back to '${name}'`); }
   catch (e) { notes.push(`rename-back failed: ${e.message}`); }
-  try { await old.start(); notes.push('restarted previous container'); }
-  catch (e) { notes.push(`restart of previous container failed: ${e.message}`); }
+  if (wasRunning) {
+    try { await old.start(); notes.push('restarted previous container'); }
+    catch (e) { notes.push(`restart of previous container failed: ${e.message}`); }
+  }
   return jsonResult({
     recreated: false,
     rolled_back: true,
@@ -1166,11 +1168,21 @@ function acquireRecreateLock(name) {
     err.code = -32000;
     throw err;
   }
-  RECREATE_LOCKS.set(name, { ts: Date.now() });
+  const lock = { ts: Date.now() };
+  RECREATE_LOCKS.set(name, lock);
+  // Refresh while the call runs — a long pull or health wait can outlast the
+  // TTL, which would otherwise let a second caller take over mid-recreate.
+  lock.timer = setInterval(() => {
+    if (RECREATE_LOCKS.get(name) === lock) lock.ts = Date.now();
+  }, RECREATE_LOCK_TTL_MS / 2);
+  lock.timer.unref?.();
+  return lock;
 }
 
-function releaseRecreateLock(name) {
-  RECREATE_LOCKS.delete(name);
+function releaseRecreateLock(name, lock) {
+  clearInterval(lock.timer);
+  // Only the owner may release: a caller that took over an expired lock owns it now
+  if (RECREATE_LOCKS.get(name) === lock) RECREATE_LOCKS.delete(name);
 }
 
 // Networks a recreate must re-attach by hand. docker inspect returns no
@@ -1180,8 +1192,9 @@ function releaseRecreateLock(name) {
 // that network with it while published host ports kept working. Default networks are excluded
 // because NetworkMode already governs them and they can't be attached
 // explicitly; the NetworkMode network is excluded to avoid a double attach.
+const DEFAULT_NETWORKS = new Set(['bridge', 'host', 'none', 'default']);
+
 function extraNetworkEndpoints(info, name) {
-  const DEFAULT_NETWORKS = new Set(['bridge', 'host', 'none', 'default']);
   const mode = info.HostConfig?.NetworkMode || 'default';
   return Object.entries(info.NetworkSettings?.Networks || {})
     .filter(([network]) => !DEFAULT_NETWORKS.has(network) && network !== mode)
@@ -1197,6 +1210,22 @@ function extraNetworkEndpoints(info, name) {
     }));
 }
 
+// The NetworkMode network is attached by Docker itself, but its aliases and
+// static IP live only in the endpoint config — pass those through explicitly.
+function primaryNetworkConfig(info, name) {
+  const mode = info.HostConfig?.NetworkMode;
+  const ep = info.NetworkSettings?.Networks?.[mode];
+  if (!ep || DEFAULT_NETWORKS.has(mode)) return null;
+  return {
+    EndpointsConfig: {
+      [mode]: {
+        Aliases: [...new Set([...(ep.Aliases || []), name])],
+        ...(ep.IPAMConfig ? { IPAMConfig: ep.IPAMConfig } : {})
+      }
+    }
+  };
+}
+
 async function recreateContainer(args, job, signal) {
   const old = docker.getContainer(args.id);
   const info = await old.inspect();
@@ -1204,17 +1233,24 @@ async function recreateContainer(args, job, signal) {
   // Re-bind by immutable ID: if the caller passed a name, that handle 404s on
   // rename-back/start once the container is renamed aside
   const oldContainer = docker.getContainer(info.Id);
-  acquireRecreateLock(name);
+  const lock = acquireRecreateLock(name);
   try {
     return await recreateContainerLocked(args, job, signal, oldContainer, info, name);
   } finally {
-    releaseRecreateLock(name);
+    releaseRecreateLock(name, lock);
   }
 }
 
 async function recreateContainerLocked(args, job, signal, old, info, name) {
-  const startTimeoutS = args.start_timeout_s ?? 30;
+  // Test: ['NONE'] disables an image's healthcheck — it is not a real check
+  const hcTest = info.Config.Healthcheck?.Test;
+  const hasHealthcheck = Array.isArray(hcTest) && !(hcTest.length === 1 && hcTest[0] === 'NONE');
+  // Docker's default health interval is 30s, so a 30s deadline can expire
+  // before the first status is reported — allow two intervals by default.
+  const hcIntervalS = (info.Config.Healthcheck?.Interval || 30e9) / 1e9;
+  const startTimeoutS = args.start_timeout_s ?? (hasHealthcheck ? Math.ceil(hcIntervalS * 2) : 30);
   const backupName = args.backup_name || `${name}-old`;
+  const wasRunning = Boolean(info.State?.Running);
 
   // Docker's name filter is a substring match — verify exact conflict
   const conflicts = await docker.listContainers({ all: true, filters: { name: [backupName] } });
@@ -1227,17 +1263,20 @@ async function recreateContainerLocked(args, job, signal, old, info, name) {
     await pullImage(info.Config.Image, job, signal);
   }
 
-  await old.stop();
+  // Docker rejects stop on an already-stopped container (304)
+  if (wasRunning) await old.stop();
   await old.rename({ name: backupName });
   job?.log(`Renamed previous container aside as '${backupName}'`);
 
   let newContainer;
   const attached = [];
   try {
+    const primaryNetwork = primaryNetworkConfig(info, name);
     newContainer = await docker.createContainer({
       name,
       ...info.Config,
-      HostConfig: info.HostConfig
+      HostConfig: info.HostConfig,
+      ...(primaryNetwork ? { NetworkingConfig: primaryNetwork } : {})
     });
     // Attach before start so the process never runs without its networks
     for (const { network, config } of extraNetworkEndpoints(info, name)) {
@@ -1249,14 +1288,13 @@ async function recreateContainerLocked(args, job, signal, old, info, name) {
     job?.log('Started replacement container');
   } catch (err) {
     // newContainer may already exist if an attach failed — rollback removes it
-    return await recreateRollback(old, name, newContainer, err, backupName);
+    return await recreateRollback(old, name, newContainer, err, backupName, wasRunning);
   }
 
   // Watch for early exit; succeed after ~2s of continuous running or when
   // the timeout elapses with the container still up. When the image defines a
   // healthcheck, success additionally requires health status 'healthy' within
   // the timeout — otherwise roll back.
-  const hasHealthcheck = Boolean(info.Config.Healthcheck);
   const deadline = Date.now() + startTimeoutS * 1000;
   let consecutive = 0;
   let newInfo = null;
@@ -1279,13 +1317,13 @@ async function recreateContainerLocked(args, job, signal, old, info, name) {
     job?.log('New container exited — rolling back');
     return await recreateRollback(old, name, newContainer, new Error(
       `New container exited: ${exitInfo.State.Status}${exitInfo.State.Error ? ` (${exitInfo.State.Error})` : ''}`
-    ), backupName);
+    ), backupName, wasRunning);
   }
   if (hasHealthcheck && !healthy) {
     job?.log('New container did not become healthy — rolling back');
     return await recreateRollback(old, name, newContainer, new Error(
       `New container did not reach healthy status within ${startTimeoutS}s (health: ${newInfo?.State?.Health?.Status || 'unknown'})`
-    ), backupName);
+    ), backupName, wasRunning);
   }
   job?.log(`Recreated successfully (backup: ${backupName})`);
 
