@@ -1,0 +1,10 @@
+node_modules/
+.DS_Store
+*.backup
+*.tar.gz
+*.db
+.env
+.claude/
+CLAUDE.local.md
+audit/
+transfer/
