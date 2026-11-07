@@ -327,6 +327,13 @@ describe('JSONL audit log', () => {
     expect(fs.readFileSync(auditPath, 'utf8')).not.toContain('supersecret123');
   });
 
+  it('redacts secrets nested inside arg objects', () => {
+    const { summarizeArgs } = require('../server');
+    const line = summarizeArgs({ build_args: { GITHUB_TOKEN: 'ghp_secret', HTTP_PROXY: 'x' } });
+    expect(line.build_args).toContain('[REDACTED]');
+    expect(line.build_args).not.toContain('ghp_secret');
+  });
+
   it('preserves a multibyte UTF-8 character split across request chunks', async () => {
     const http = require('http');
     const body = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call',
@@ -576,9 +583,16 @@ describe('REST /stop confirm gate', () => {
 
   it('returns 409 with the confirm token instead of a false success', async () => {
     process.env.CONFIRM_TOOLS = 'docker_stop';
-    const res = await request(app).post('/stop').set(AUTH).send({ id: 'abc' });
-    expect(res.status).toBe(409);
-    expect(res.body.confirm_required).toBe(true);
-    expect(res.body.confirm_token).toBeTruthy();
+    const first = await request(app).post('/stop').set(AUTH).send({ id: 'abc' });
+    expect(first.status).toBe(409);
+    expect(first.body.confirm_required).toBe(true);
+    expect(first.body.confirm_token).toBeTruthy();
+
+    // The retry must forward the token, not discard it and mint a new one
+    const mockDocker = require('dockerode').mock.results[0].value;
+    mockDocker.getContainer.mockReturnValueOnce({ stop: jest.fn().mockResolvedValue({}) });
+    const second = await request(app).post('/stop').set(AUTH)
+      .send({ id: 'abc', confirm_token: first.body.confirm_token });
+    expect(second.status).toBe(200);
   });
 });

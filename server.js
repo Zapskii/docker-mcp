@@ -712,7 +712,8 @@ const MCP_TOOLS = [
           description: 'Scope the prune: ["until=24h", "label=keep.team=x", "name=nginx"]. label= is PROTECTION — images carrying that label are spared; until= only touches images created before that duration ago; name= restricts to repo tags containing the substring. Also accepts the object form { until, label, name }.',
           items: { type: 'string' }
         },
-        dry_run: { type: 'boolean', description: 'List what WOULD be removed without removing anything', default: false }
+        dry_run: { type: 'boolean', description: 'List what WOULD be removed without removing anything', default: false },
+        confirm: { type: 'boolean', description: 'Required when all is truthy — pass confirm: true to remove every unused image, not just dangling ones. Dry runs do not need it.' }
       }
     }
   },
@@ -1187,16 +1188,18 @@ function extraNetworkEndpoints(info, name) {
   const mode = info.HostConfig?.NetworkMode || 'default';
   return Object.entries(info.NetworkSettings?.Networks || {})
     .filter(([network]) => !DEFAULT_NETWORKS.has(network) && network !== mode)
-    .map(([network, ep]) => ({
-      network,
-      config: {
-        // Docker auto-adds the container's own name as an alias; pass it
-        // explicitly so resolution never depends on that. The stale old
-        // container-id alias is not copied — it lives in DNSNames, not Aliases.
-        Aliases: [...new Set([...(ep.Aliases || []), name])],
-        ...(ep.IPAMConfig ? { IPAMConfig: ep.IPAMConfig } : {})
-      }
-    }));
+    .map(([network, ep]) => ({ network, config: endpointConfig(ep, name) }));
+}
+
+// Endpoint config shared by the primary and extra network attachments.
+function endpointConfig(ep, name) {
+  return {
+    // Docker auto-adds the container's own name as an alias; pass it
+    // explicitly so resolution never depends on that. The stale old
+    // container-id alias is not copied — it lives in DNSNames, not Aliases.
+    Aliases: [...new Set([...(ep.Aliases || []), name])],
+    ...(ep.IPAMConfig ? { IPAMConfig: ep.IPAMConfig } : {})
+  };
 }
 
 // The NetworkMode network is attached by Docker itself, but its aliases and
@@ -1205,14 +1208,7 @@ function primaryNetworkConfig(info, name) {
   const mode = info.HostConfig?.NetworkMode;
   const ep = info.NetworkSettings?.Networks?.[mode];
   if (!ep || DEFAULT_NETWORKS.has(mode)) return null;
-  return {
-    EndpointsConfig: {
-      [mode]: {
-        Aliases: [...new Set([...(ep.Aliases || []), name])],
-        ...(ep.IPAMConfig ? { IPAMConfig: ep.IPAMConfig } : {})
-      }
-    }
-  };
+  return { EndpointsConfig: { [mode]: endpointConfig(ep, name) } };
 }
 
 async function recreateContainer(args, job, signal) {
@@ -1237,10 +1233,13 @@ async function recreateContainerLocked(args, job, signal, old, info, name) {
   // Docker's default health interval is 30s, so a 30s deadline can expire
   // before the first status is reported — allow two intervals by default.
   const hcIntervalS = (info.Config.Healthcheck?.Interval || 30e9) / 1e9;
+  // Include StartPeriod: during it Docker always reports 'starting', so a
+  // deadline shorter than it would roll back a container that is still fine.
+  const hcStartS = (info.Config.Healthcheck?.StartPeriod || 0) / 1e9;
   // Clamp caller/metadata-derived timeouts so a bad Interval can't pin the
   // recreate (and its lock) open for hours.
   const startTimeoutS = Math.min(Math.max(
-    Number(args.start_timeout_s) || (hasHealthcheck ? Math.ceil(hcIntervalS * 2) : 30), 1), 600);
+    Number(args.start_timeout_s) || (hasHealthcheck ? Math.ceil(hcStartS + hcIntervalS * 2) : 30), 1), 600);
   const backupName = args.backup_name || `${name}-old`;
   const wasRunning = Boolean(info.State?.Running);
 
@@ -1264,9 +1263,13 @@ async function recreateContainerLocked(args, job, signal, old, info, name) {
   const attached = [];
   try {
     const primaryNetwork = primaryNetworkConfig(info, name);
+    const createConfig = { ...info.Config };
+    // Docker defaults Hostname to the old container's 12-char ID; drop it so
+    // the replacement doesn't inherit a stale ID, but keep a user-set one.
+    if (createConfig.Hostname === info.Id.slice(0, 12)) delete createConfig.Hostname;
     newContainer = await docker.createContainer({
       name,
-      ...info.Config,
+      ...createConfig,
       HostConfig: info.HostConfig,
       ...(primaryNetwork ? { NetworkingConfig: primaryNetwork } : {})
     });
@@ -1803,8 +1806,9 @@ async function handleMCPTool(name, args) {
           would_remove: images.map(i => ({ id: i.Id, tags: i.RepoTags || [] }))
         });
       }
-      // all:true removes every unused image, not just dangling ones — gate it
-      await requireConfirm('docker_image_prune', args, 'all unused images', args.all === true);
+      // all:true removes every unused image, not just dangling ones — gate it.
+      // Match the prune branch's truthiness so a non-boolean "true" can't skip it.
+      await requireConfirm('docker_image_prune', args, 'all unused images', Boolean(args.all));
       if (Object.keys(f).length > 0) {
         const images = await resolveCandidates();
         const deleted = [];
@@ -2364,13 +2368,26 @@ function keyFingerprint(key) {
 // Top-level arg values, truncated — enough to identify a call, not enough to
 // replay secrets (env maps, tokens) into logs
 function summarizeArgs(args) {
+  // Secrets sit both at top level (password/token) and nested (build_args/env)
+  // — redact by key name at any depth before truncating.
+  const scrub = v => {
+    if (Array.isArray(v)) return v.map(scrub);
+    if (v && typeof v === 'object') {
+      const o = {};
+      for (const [k, iv] of Object.entries(v)) {
+        o[k] = /password|token|secret|^env$/i.test(k) ? '[REDACTED]' : scrub(iv);
+      }
+      return o;
+    }
+    return v;
+  };
   const out = {};
   for (const [k, v] of Object.entries(args || {})) {
     if (v === undefined) continue;
-    if (/password|token|secret|^env$/i.test(k)) { out[k] = '[REDACTED]'; continue; }
+    const value = /password|token|secret|^env$/i.test(k) ? '[REDACTED]' : scrub(v);
     let s;
-    if (typeof v === 'string') s = v;
-    else { try { s = JSON.stringify(v); } catch (_) { s = String(v); } }
+    if (typeof value === 'string') s = value;
+    else { try { s = JSON.stringify(value); } catch (_) { s = String(value); } }
     out[k] = s.length > 40 ? s.slice(0, 40) + '…' : s;
   }
   return out;
@@ -2822,10 +2839,12 @@ const app = http.createServer(async (req, res) => {
     const body = await readBody(req, res).catch(() => null);
     if (body === null) return;
     try {
-      const { id } = JSON.parse(body);
+      const args = JSON.parse(body);
+      const { id } = args;
       // Route through callToolLogged so /stop gets the same self-guard and
-      // audit entry as the docker_stop MCP tool.
-      const result = await callToolLogged('docker_stop', { id }, req.agentName, req.keyFp);
+      // audit entry as the docker_stop MCP tool. Pass the full body so a
+      // confirm_token is forwarded too.
+      const result = await callToolLogged('docker_stop', args, req.agentName, req.keyFp);
       if (result?.structuredContent?.confirm_required) {
         res.writeHead(409, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result.structuredContent));
@@ -2925,7 +2944,7 @@ function setupLogWebSocket(server) {
   return { wss };
 }
 
-module.exports = { app, handleMCPTool, callToolLogged, sendMCPResponse, MCP_TOOLS, sessions, sweepSessions, parseApiKeys, RECREATE_LOCKS, REGISTRY_AUTH, setupLogWebSocket, setSelfContainerIdForTests };
+module.exports = { app, handleMCPTool, callToolLogged, sendMCPResponse, MCP_TOOLS, sessions, sweepSessions, parseApiKeys, summarizeArgs, RECREATE_LOCKS, REGISTRY_AUTH, setupLogWebSocket, setSelfContainerIdForTests };
 
 if (require.main === module) {
   const PORT = process.env.PORT || 3001;

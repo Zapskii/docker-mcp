@@ -35,6 +35,9 @@ describe('docker_image_prune', () => {
   it('requires confirm:true for all=true, but not for a dry run', async () => {
     await expect(handleMCPTool('docker_image_prune', { all: true }))
       .rejects.toThrow(/Confirmation required/);
+    // Truthy non-boolean is still the destructive branch — must not skip the gate
+    await expect(handleMCPTool('docker_image_prune', { all: 'true' }))
+      .rejects.toThrow(/Confirmation required/);
     expect(mockDocker.pruneImages).not.toHaveBeenCalled();
     const dry = await handleMCPTool('docker_image_prune', { all: true, dry_run: true });
     expect(JSON.parse(dry.content[0].text).dry_run).toBe(true);
@@ -1214,7 +1217,7 @@ describe('docker_container_recreate', () => {
     Id:   'old1234567890',
     Name: '/web',
     Image: 'sha256:oldimage',
-    Config: { Image: 'nginx:latest', Env: ['A=1'] },
+    Config: { Image: 'nginx:latest', Env: ['A=1'], Hostname: 'old123456789' },
     HostConfig: { Binds: ['/data:/data'], RestartPolicy: { Name: 'always' }, NetworkMode: 'bridge' },
     // Real inspect shape: no top-level NetworkingConfig, attachments live here
     NetworkSettings: { Networks: { bridge: { Aliases: null, IPAMConfig: null } } },
@@ -1248,6 +1251,8 @@ describe('docker_container_recreate', () => {
       Env: ['A=1'],
       HostConfig: oldInfo.HostConfig
     }));
+    // The old container's default Hostname is its 12-char ID — not carried over
+    expect(mockDocker.createContainer.mock.calls[0][0]).not.toHaveProperty('Hostname');
     // inspect has no NetworkingConfig to forward — passing it was a no-op
     expect(mockDocker.createContainer.mock.calls[0][0]).not.toHaveProperty('NetworkingConfig');
     expect(oldC.stop).toHaveBeenCalled();
