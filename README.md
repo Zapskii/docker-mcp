@@ -1,5 +1,7 @@
 # docker-mcp
 
+An MCP server for managing Docker in a home lab.
+
 > ⚠️ **Internal use only. Do not expose this MCP server to the internet.**
 >
 > This server mounts the Docker socket and can start, stop and delete anything on

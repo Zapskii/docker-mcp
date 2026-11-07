@@ -25,8 +25,8 @@ your LAN hostname or IP, and never commit real keys.
 ## 2. Build the image
 
 ```bash
-git clone <repo-url> docker-mcp-public
-cd docker-mcp-public
+git clone https://github.com/Zapskii/docker-mcp.git
+cd docker-mcp
 docker build -t docker-mcp .
 ```
 
