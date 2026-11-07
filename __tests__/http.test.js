@@ -18,6 +18,11 @@ describe('Health check', () => {
     const res = await request(app).get('/health');
     expect(res.body.version).toBe('2.13.6');
   });
+
+  it('returns 400 for a malformed Host header instead of hanging', async () => {
+    const res = await request(app).get('/health').set('Host', 'bad host');
+    expect(res.status).toBe(400);
+  });
 });
 
 describe('Auth', () => {
@@ -281,6 +286,96 @@ describe('JSONL audit log', () => {
     const lines = readLines();
     expect(lines[0].args.confirm).toBe('true');
   });
+
+  it('audits docker_copy and docker_volume_restore as mutating tools', async () => {
+    await request(app).post('/mcp').set(AUTH)
+      .send({ jsonrpc: '2.0', id: 1, method: 'tools/call',
+              params: { name: 'docker_copy', arguments: { id: 'abc', direction: 'from', container_path: '/etc/hosts' } } });
+    // Missing backup_path errors before shelling out — still a mutating call, so it must be audited
+    await request(app).post('/mcp').set(AUTH)
+      .send({ jsonrpc: '2.0', id: 2, method: 'tools/call',
+              params: { name: 'docker_volume_restore', arguments: { name: 'v' } } });
+    expect(readLines().map(l => l.tool)).toEqual(['docker_copy', 'docker_volume_restore']);
+  });
+
+  it('audits REST /run and /stop', async () => {
+    const mockDocker = require('dockerode').mock.results[0].value;
+    mockDocker.pull.mockImplementationOnce((...args) => {
+      args[args.length - 1](null, { on: () => {}, destroy: () => {} });
+    });
+    mockDocker.modem.followProgress.mockImplementationOnce((stream, cb) => cb(null, []));
+
+    const run = await request(app).post('/run').set(AUTH).send({ image: 'nginx:latest' });
+    expect(run.status).toBe(200);
+    const stop = await request(app).post('/stop').set(AUTH).send({ id: 'abc' });
+    expect(stop.status).toBe(200);
+
+    expect(readLines().map(l => l.tool).sort()).toEqual(['docker_run', 'docker_stop']);
+  });
+
+  it('redacts docker_run env values in the audit log', async () => {
+    const mockDocker = require('dockerode').mock.results[0].value;
+    mockDocker.pull.mockImplementationOnce((...args) => {
+      args[args.length - 1](null, { on: () => {}, destroy: () => {} });
+    });
+    mockDocker.modem.followProgress.mockImplementationOnce((stream, cb) => cb(null, []));
+
+    const run = await request(app).post('/run').set(AUTH)
+      .send({ image: 'nginx:latest', env: { DB_PASSWORD: 'supersecret123' } });
+    expect(run.status).toBe(200);
+    expect(readLines()[0].args.env).toBe('[REDACTED]');
+    expect(fs.readFileSync(auditPath, 'utf8')).not.toContain('supersecret123');
+  });
+
+  it('redacts secrets nested inside arg objects', () => {
+    const { summarizeArgs } = require('../server');
+    const line = summarizeArgs({ build_args: { GITHUB_TOKEN: 'ghp_secret', HTTP_PROXY: 'x' } });
+    expect(line.build_args).toContain('[REDACTED]');
+    expect(line.build_args).not.toContain('ghp_secret');
+  });
+
+  it('preserves a multibyte UTF-8 character split across request chunks', async () => {
+    const http = require('http');
+    const body = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'docker_remove', arguments: { id: 'x€y' } } }));
+    const split = body.indexOf(Buffer.from('€')) + 1; // inside the 3-byte sequence
+
+    const live = app.listen(0, '127.0.0.1');
+    await new Promise(r => live.once('listening', r));
+    await new Promise((resolve, reject) => {
+      const req = http.request({
+        port: live.address().port, host: '127.0.0.1', path: '/mcp', method: 'POST',
+        headers: { 'x-api-key': 'test-key', 'content-type': 'application/json', 'content-length': body.length }
+      }, res => { res.resume(); res.on('end', resolve); });
+      req.on('error', reject);
+      req.write(body.subarray(0, split));
+      setTimeout(() => { req.write(body.subarray(split)); req.end(); }, 20);
+    });
+    await new Promise(r => live.close(r));
+
+    expect(readLines()[0].args.id).toBe('x€y');
+  });
+});
+
+describe('REST /stop self-guard', () => {
+  const { setSelfContainerIdForTests } = require('../server');
+  const SELF_ID = 'a'.repeat(64);
+
+  afterEach(() => setSelfContainerIdForTests(undefined));
+
+  it('refuses to stop the server\'s own container', async () => {
+    setSelfContainerIdForTests(SELF_ID);
+    const mockDocker = require('dockerode').mock.results[0].value;
+    mockDocker.getContainer.mockImplementationOnce(() => ({
+      inspect: jest.fn().mockResolvedValue({ Id: SELF_ID }),
+      stop: jest.fn().mockResolvedValue({})
+    }));
+
+    const res = await request(app).post('/stop').set(AUTH).send({ id: 'self-container' });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toMatch(/own container/);
+  });
 });
 
 describe('two-phase confirm for destructive tools', () => {
@@ -480,5 +575,24 @@ describe('REST /run registry credentials', () => {
     } finally {
       REGISTRY_AUTH.clear();
     }
+  });
+});
+
+describe('REST /stop confirm gate', () => {
+  afterEach(() => { delete process.env.CONFIRM_TOOLS; });
+
+  it('returns 409 with the confirm token instead of a false success', async () => {
+    process.env.CONFIRM_TOOLS = 'docker_stop';
+    const first = await request(app).post('/stop').set(AUTH).send({ id: 'abc' });
+    expect(first.status).toBe(409);
+    expect(first.body.confirm_required).toBe(true);
+    expect(first.body.confirm_token).toBeTruthy();
+
+    // The retry must forward the token, not discard it and mint a new one
+    const mockDocker = require('dockerode').mock.results[0].value;
+    mockDocker.getContainer.mockReturnValueOnce({ stop: jest.fn().mockResolvedValue({}) });
+    const second = await request(app).post('/stop').set(AUTH)
+      .send({ id: 'abc', confirm_token: first.body.confirm_token });
+    expect(second.status).toBe(200);
   });
 });

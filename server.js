@@ -712,7 +712,8 @@ const MCP_TOOLS = [
           description: 'Scope the prune: ["until=24h", "label=keep.team=x", "name=nginx"]. label= is PROTECTION — images carrying that label are spared; until= only touches images created before that duration ago; name= restricts to repo tags containing the substring. Also accepts the object form { until, label, name }.',
           items: { type: 'string' }
         },
-        dry_run: { type: 'boolean', description: 'List what WOULD be removed without removing anything', default: false }
+        dry_run: { type: 'boolean', description: 'List what WOULD be removed without removing anything', default: false },
+        confirm: { type: 'boolean', description: 'Required when all is truthy — pass confirm: true to remove every unused image, not just dangling ones. Dry runs do not need it.' }
       }
     }
   },
@@ -773,18 +774,7 @@ const MCP_TOOLS = [
         memory: { type: 'number', description: 'Memory limit in bytes' },
         memorySwap: { type: 'number', description: 'Total memory+swap limit in bytes (-1 = unlimited)' },
         memoryReservation: { type: 'number', description: 'Soft memory limit in bytes' },
-        pidsLimit: { type: 'number', description: 'Max number of processes (-1 = unlimited)' },
-        healthcheck: {
-          type: 'object',
-          description: 'Replace the container healthcheck (usable with docker_wait condition=healthy and recreate rollback)',
-          properties: {
-            test: { type: ['string', 'array'], description: 'Shell command string (wrapped in CMD-SHELL) or exec-form array, e.g. "curl -f http://localhost/"' },
-            interval_s: { type: 'number', description: 'Seconds between checks' },
-            timeout_s: { type: 'number', description: 'Seconds before a single check counts as failed' },
-            retries: { type: 'integer', description: 'Consecutive failures before unhealthy' },
-            start_period_s: { type: 'number', description: 'Grace period before failures count toward retries' }
-          }
-        }
+        pidsLimit: { type: 'number', description: 'Max number of processes (-1 = unlimited)' }
       },
       required: ['id']
     }
@@ -999,7 +989,7 @@ const MCP_TOOLS = [
   },
 ];
 
-async function recreateRollback(old, name, newContainer, err, backupName) {
+async function recreateRollback(old, name, newContainer, err, backupName, wasRunning) {
   const notes = [];
   if (newContainer) {
     try { await newContainer.remove({ force: true }); notes.push('removed failed new container'); }
@@ -1007,8 +997,10 @@ async function recreateRollback(old, name, newContainer, err, backupName) {
   }
   try { await old.rename({ name }); notes.push(`renamed backup back to '${name}'`); }
   catch (e) { notes.push(`rename-back failed: ${e.message}`); }
-  try { await old.start(); notes.push('restarted previous container'); }
-  catch (e) { notes.push(`restart of previous container failed: ${e.message}`); }
+  if (wasRunning) {
+    try { await old.start(); notes.push('restarted previous container'); }
+    catch (e) { notes.push(`restart of previous container failed: ${e.message}`); }
+  }
   return jsonResult({
     recreated: false,
     rolled_back: true,
@@ -1166,11 +1158,21 @@ function acquireRecreateLock(name) {
     err.code = -32000;
     throw err;
   }
-  RECREATE_LOCKS.set(name, { ts: Date.now() });
+  const lock = { ts: Date.now() };
+  RECREATE_LOCKS.set(name, lock);
+  // Refresh while the call runs — a long pull or health wait can outlast the
+  // TTL, which would otherwise let a second caller take over mid-recreate.
+  lock.timer = setInterval(() => {
+    if (RECREATE_LOCKS.get(name) === lock) lock.ts = Date.now();
+  }, RECREATE_LOCK_TTL_MS / 2);
+  lock.timer.unref?.();
+  return lock;
 }
 
-function releaseRecreateLock(name) {
-  RECREATE_LOCKS.delete(name);
+function releaseRecreateLock(name, lock) {
+  clearInterval(lock.timer);
+  // Only the owner may release: a caller that took over an expired lock owns it now
+  if (RECREATE_LOCKS.get(name) === lock) RECREATE_LOCKS.delete(name);
 }
 
 // Networks a recreate must re-attach by hand. docker inspect returns no
@@ -1180,21 +1182,33 @@ function releaseRecreateLock(name) {
 // that network with it while published host ports kept working. Default networks are excluded
 // because NetworkMode already governs them and they can't be attached
 // explicitly; the NetworkMode network is excluded to avoid a double attach.
+const DEFAULT_NETWORKS = new Set(['bridge', 'host', 'none', 'default']);
+
 function extraNetworkEndpoints(info, name) {
-  const DEFAULT_NETWORKS = new Set(['bridge', 'host', 'none', 'default']);
   const mode = info.HostConfig?.NetworkMode || 'default';
   return Object.entries(info.NetworkSettings?.Networks || {})
     .filter(([network]) => !DEFAULT_NETWORKS.has(network) && network !== mode)
-    .map(([network, ep]) => ({
-      network,
-      config: {
-        // Docker auto-adds the container's own name as an alias; pass it
-        // explicitly so resolution never depends on that. The stale old
-        // container-id alias is not copied — it lives in DNSNames, not Aliases.
-        Aliases: [...new Set([...(ep.Aliases || []), name])],
-        ...(ep.IPAMConfig ? { IPAMConfig: ep.IPAMConfig } : {})
-      }
-    }));
+    .map(([network, ep]) => ({ network, config: endpointConfig(ep, name) }));
+}
+
+// Endpoint config shared by the primary and extra network attachments.
+function endpointConfig(ep, name) {
+  return {
+    // Docker auto-adds the container's own name as an alias; pass it
+    // explicitly so resolution never depends on that. The stale old
+    // container-id alias is not copied — it lives in DNSNames, not Aliases.
+    Aliases: [...new Set([...(ep.Aliases || []), name])],
+    ...(ep.IPAMConfig ? { IPAMConfig: ep.IPAMConfig } : {})
+  };
+}
+
+// The NetworkMode network is attached by Docker itself, but its aliases and
+// static IP live only in the endpoint config — pass those through explicitly.
+function primaryNetworkConfig(info, name) {
+  const mode = info.HostConfig?.NetworkMode;
+  const ep = info.NetworkSettings?.Networks?.[mode];
+  if (!ep || DEFAULT_NETWORKS.has(mode)) return null;
+  return { EndpointsConfig: { [mode]: endpointConfig(ep, name) } };
 }
 
 async function recreateContainer(args, job, signal) {
@@ -1204,17 +1218,30 @@ async function recreateContainer(args, job, signal) {
   // Re-bind by immutable ID: if the caller passed a name, that handle 404s on
   // rename-back/start once the container is renamed aside
   const oldContainer = docker.getContainer(info.Id);
-  acquireRecreateLock(name);
+  const lock = acquireRecreateLock(name);
   try {
     return await recreateContainerLocked(args, job, signal, oldContainer, info, name);
   } finally {
-    releaseRecreateLock(name);
+    releaseRecreateLock(name, lock);
   }
 }
 
 async function recreateContainerLocked(args, job, signal, old, info, name) {
-  const startTimeoutS = args.start_timeout_s ?? 30;
+  // Test: ['NONE'] disables an image's healthcheck — it is not a real check
+  const hcTest = info.Config.Healthcheck?.Test;
+  const hasHealthcheck = Array.isArray(hcTest) && !(hcTest.length === 1 && hcTest[0] === 'NONE');
+  // Docker's default health interval is 30s, so a 30s deadline can expire
+  // before the first status is reported — allow two intervals by default.
+  const hcIntervalS = (info.Config.Healthcheck?.Interval || 30e9) / 1e9;
+  // Include StartPeriod: during it Docker always reports 'starting', so a
+  // deadline shorter than it would roll back a container that is still fine.
+  const hcStartS = (info.Config.Healthcheck?.StartPeriod || 0) / 1e9;
+  // Clamp caller/metadata-derived timeouts so a bad Interval can't pin the
+  // recreate (and its lock) open for hours.
+  const startTimeoutS = Math.min(Math.max(
+    Number(args.start_timeout_s) || (hasHealthcheck ? Math.ceil(hcStartS + hcIntervalS * 2) : 30), 1), 600);
   const backupName = args.backup_name || `${name}-old`;
+  const wasRunning = Boolean(info.State?.Running);
 
   // Docker's name filter is a substring match — verify exact conflict
   const conflicts = await docker.listContainers({ all: true, filters: { name: [backupName] } });
@@ -1227,17 +1254,24 @@ async function recreateContainerLocked(args, job, signal, old, info, name) {
     await pullImage(info.Config.Image, job, signal);
   }
 
-  await old.stop();
+  // Docker rejects stop on an already-stopped container (304)
+  if (wasRunning) await old.stop();
   await old.rename({ name: backupName });
   job?.log(`Renamed previous container aside as '${backupName}'`);
 
   let newContainer;
   const attached = [];
   try {
+    const primaryNetwork = primaryNetworkConfig(info, name);
+    const createConfig = { ...info.Config };
+    // Docker defaults Hostname to the old container's 12-char ID; drop it so
+    // the replacement doesn't inherit a stale ID, but keep a user-set one.
+    if (createConfig.Hostname === info.Id.slice(0, 12)) delete createConfig.Hostname;
     newContainer = await docker.createContainer({
       name,
-      ...info.Config,
-      HostConfig: info.HostConfig
+      ...createConfig,
+      HostConfig: info.HostConfig,
+      ...(primaryNetwork ? { NetworkingConfig: primaryNetwork } : {})
     });
     // Attach before start so the process never runs without its networks
     for (const { network, config } of extraNetworkEndpoints(info, name)) {
@@ -1249,20 +1283,23 @@ async function recreateContainerLocked(args, job, signal, old, info, name) {
     job?.log('Started replacement container');
   } catch (err) {
     // newContainer may already exist if an attach failed — rollback removes it
-    return await recreateRollback(old, name, newContainer, err, backupName);
+    return await recreateRollback(old, name, newContainer, err, backupName, wasRunning);
   }
 
   // Watch for early exit; succeed after ~2s of continuous running or when
   // the timeout elapses with the container still up. When the image defines a
   // healthcheck, success additionally requires health status 'healthy' within
   // the timeout — otherwise roll back.
-  const hasHealthcheck = Boolean(info.Config.Healthcheck);
   const deadline = Date.now() + startTimeoutS * 1000;
   let consecutive = 0;
   let newInfo = null;
   let exitInfo = null;
   let healthy = false;
   while (Date.now() < deadline) {
+    if (signal?.aborted) {
+      job?.log('Recreate cancelled — rolling back');
+      return await recreateRollback(old, name, newContainer, new Error('cancelled'), backupName, wasRunning);
+    }
     await sleep(1000);
     const st = await newContainer.inspect();
     if (!st.State.Running) { exitInfo = st; break; }
@@ -1279,13 +1316,13 @@ async function recreateContainerLocked(args, job, signal, old, info, name) {
     job?.log('New container exited — rolling back');
     return await recreateRollback(old, name, newContainer, new Error(
       `New container exited: ${exitInfo.State.Status}${exitInfo.State.Error ? ` (${exitInfo.State.Error})` : ''}`
-    ), backupName);
+    ), backupName, wasRunning);
   }
   if (hasHealthcheck && !healthy) {
     job?.log('New container did not become healthy — rolling back');
     return await recreateRollback(old, name, newContainer, new Error(
       `New container did not reach healthy status within ${startTimeoutS}s (health: ${newInfo?.State?.Health?.Status || 'unknown'})`
-    ), backupName);
+    ), backupName, wasRunning);
   }
   job?.log(`Recreated successfully (backup: ${backupName})`);
 
@@ -1322,30 +1359,35 @@ async function handleMCPTool(name, args) {
     }
 
     case 'docker_run': {
-      if (args.pull !== false) await pullImage(args.image);
-      const container = await docker.createContainer({
-        Image: args.image,
-        Cmd: normalizeCommand(args.command),
-        name: args.name,
-        Healthcheck: parseHealthcheck(args.healthcheck),
-        ExposedPorts: args.ports ? Object.fromEntries(
-          Object.values(args.ports).map(c => [`${c}/tcp`, {}])
-        ) : undefined,
-        HostConfig: {
-          PortBindings: args.ports ? Object.fromEntries(
-            Object.entries(args.ports).map(([h, c]) => [
-              `${c}/tcp`, [{ HostPort: h }]
-            ])
+      const doRun = async (job, signal) => {
+        if (args.pull !== false) await pullImage(args.image, job, signal);
+        const container = await docker.createContainer({
+          Image: args.image,
+          Cmd: normalizeCommand(args.command),
+          name: args.name,
+          Healthcheck: parseHealthcheck(args.healthcheck),
+          ExposedPorts: args.ports ? Object.fromEntries(
+            Object.values(args.ports).map(c => [`${c}/tcp`, {}])
           ) : undefined,
-          Binds: args.volumes || [],
-          RestartPolicy: parseRestartPolicy(args.restartPolicy, args.maximumRetryCount)
-        },
-        Env: args.env ? Object.entries(args.env).map(([k, v]) => `${k}=${v}`) : undefined
-      });
-      await container.start();
-      return {
-        content: [{ type: 'text', text: `Started container: ${container.id.substring(0, 12)}` }]
+          HostConfig: {
+            PortBindings: args.ports ? Object.fromEntries(
+              Object.entries(args.ports).map(([h, c]) => [
+                `${c}/tcp`, [{ HostPort: h }]
+              ])
+            ) : undefined,
+            Binds: args.volumes || [],
+            RestartPolicy: parseRestartPolicy(args.restartPolicy, args.maximumRetryCount)
+          },
+          Env: args.env ? Object.entries(args.env).map(([k, v]) => `${k}=${v}`) : undefined
+        });
+        await container.start();
+        return `Started container: ${container.id.substring(0, 12)}`;
       };
+      if (args.mode === 'async') {
+        const started = await startJob('run', doRun);
+        return { content: [{ type: 'text', text: JSON.stringify(started, null, 2) }] };
+      }
+      return { content: [{ type: 'text', text: await doRun() }] };
     }
 
     case 'docker_stop': {
@@ -1577,12 +1619,17 @@ async function handleMCPTool(name, args) {
     }
 
     case 'docker_stats': {
+      // docker stats reports % of one core: scale by online_cpus
+      const cpuPct = s => {
+        const cpuDelta = s.cpu_stats.cpu_usage.total_usage - s.precpu_stats.cpu_usage.total_usage;
+        const systemDelta = s.cpu_stats.system_cpu_usage - s.precpu_stats.system_cpu_usage;
+        const cpus = s.cpu_stats.online_cpus || (s.cpu_stats.cpu_usage.percpu_usage || []).length || 1;
+        return systemDelta > 0 ? (cpuDelta / systemDelta * cpus * 100).toFixed(2) : '0.00';
+      };
       if (args.id) {
         const container = docker.getContainer(args.id);
         const stats = await container.stats({ stream: false });
-        const cpuDelta = stats.cpu_stats.cpu_usage.total_usage - stats.precpu_stats.cpu_usage.total_usage;
-        const systemDelta = stats.cpu_stats.system_cpu_usage - stats.precpu_stats.system_cpu_usage;
-        const cpuPercent = systemDelta > 0 ? ((cpuDelta / systemDelta) * 100).toFixed(2) : '0.00';
+        const cpuPercent = cpuPct(stats);
         const memUsage = (stats.memory_stats.usage / 1024 / 1024).toFixed(2);
         const memLimit = (stats.memory_stats.limit / 1024 / 1024).toFixed(2);
         return {
@@ -1596,9 +1643,7 @@ async function handleMCPTool(name, args) {
             try {
               const container = docker.getContainer(containerInfo.Id);
               const stats = await container.stats({ stream: false });
-              const cpuDelta = stats.cpu_stats.cpu_usage.total_usage - stats.precpu_stats.cpu_usage.total_usage;
-              const systemDelta = stats.cpu_stats.system_cpu_usage - stats.precpu_stats.system_cpu_usage;
-              const cpuPercent = systemDelta > 0 ? ((cpuDelta / systemDelta) * 100).toFixed(2) : '0.00';
+              const cpuPercent = cpuPct(stats);
               const memUsage = (stats.memory_stats.usage / 1024 / 1024).toFixed(2);
               const memLimit = (stats.memory_stats.limit / 1024 / 1024).toFixed(2);
               return `${name}\t${cpuPercent}%\t${memUsage}MiB / ${memLimit}MiB`;
@@ -1765,6 +1810,9 @@ async function handleMCPTool(name, args) {
           would_remove: images.map(i => ({ id: i.Id, tags: i.RepoTags || [] }))
         });
       }
+      // all:true removes every unused image, not just dangling ones — gate it.
+      // Match the prune branch's truthiness so a non-boolean "true" can't skip it.
+      await requireConfirm('docker_image_prune', args, 'all unused images', Boolean(args.all));
       if (Object.keys(f).length > 0) {
         const images = await resolveCandidates();
         const deleted = [];
@@ -1777,7 +1825,9 @@ async function handleMCPTool(name, args) {
           content: [{ type: 'text', text: JSON.stringify({ ImagesDeleted: deleted, Errors: errors }, null, 2) }]
         };
       }
-      const result = await docker.pruneImages(args.all ? {} : { filters: { dangling: { 'true': true } } });
+      const result = await docker.pruneImages(args.all
+        ? { filters: { dangling: ['false'] } }
+        : { filters: { dangling: { 'true': true } } });
       return {
         content: [{ type: 'text', text: `Pruned images:\n${JSON.stringify(result, null, 2)}` }]
       };
@@ -1848,8 +1898,6 @@ async function handleMCPTool(name, args) {
       const update = {};
       const policy = parseRestartPolicy(args.restartPolicy, args.maximumRetryCount);
       if (policy) update.RestartPolicy = policy;
-      const healthcheck = parseHealthcheck(args.healthcheck);
-      if (healthcheck) update.Healthcheck = healthcheck;
       for (const [argKey, field] of [
         ['nanoCpus', 'NanoCpus'], ['cpuShares', 'CpuShares'],
         ['cpuPeriod', 'CpuPeriod'], ['cpuQuota', 'CpuQuota'],
@@ -2257,7 +2305,7 @@ const MAX_BODY = 1_048_576; // 1 MB
 
 function readBody(req, res) {
   return new Promise((resolve, reject) => {
-    let body = '';
+    const chunks = [];
     let size = 0;
     req.on('data', chunk => {
       size += chunk.length;
@@ -2268,9 +2316,11 @@ function readBody(req, res) {
         reject(new Error('body too large'));
         return;
       }
-      body += chunk;
+      chunks.push(chunk);
     });
-    req.on('end', () => resolve(body));
+    // Decode once over the whole body: toString() per chunk corrupts a
+    // multibyte UTF-8 char split across TCP chunks.
+    req.on('end', () => resolve(Buffer.concat(chunks).toString()));
     req.on('error', reject);
   });
 }
@@ -2304,10 +2354,10 @@ const fs = require('fs');
 
 const MUTATING_TOOLS = new Set([
   'docker_run', 'docker_stop', 'docker_remove', 'docker_start', 'docker_restart',
-  'docker_rename', 'docker_container_update', 'docker_exec',
+  'docker_rename', 'docker_container_update', 'docker_exec', 'docker_copy',
   'docker_pull', 'docker_build', 'docker_image_rm', 'docker_image_tag',
   'docker_image_prune', 'docker_container_prune',
-  'docker_volume_create', 'docker_volume_rm', 'docker_volume_backup',
+  'docker_volume_create', 'docker_volume_rm', 'docker_volume_backup', 'docker_volume_restore',
   'docker_network_create', 'docker_network_rm', 'docker_network_connect', 'docker_network_disconnect',
   'docker_compose_up', 'docker_compose_down', 'docker_compose_build',
   'docker_compose_pull', 'docker_compose_restart',
@@ -2322,12 +2372,26 @@ function keyFingerprint(key) {
 // Top-level arg values, truncated — enough to identify a call, not enough to
 // replay secrets (env maps, tokens) into logs
 function summarizeArgs(args) {
+  // Secrets sit both at top level (password/token) and nested (build_args/env)
+  // — redact by key name at any depth before truncating.
+  const scrub = v => {
+    if (Array.isArray(v)) return v.map(scrub);
+    if (v && typeof v === 'object') {
+      const o = {};
+      for (const [k, iv] of Object.entries(v)) {
+        o[k] = /password|token|secret|^env$/i.test(k) ? '[REDACTED]' : scrub(iv);
+      }
+      return o;
+    }
+    return v;
+  };
   const out = {};
   for (const [k, v] of Object.entries(args || {})) {
-    if (/password|token|secret/i.test(k)) { out[k] = '[REDACTED]'; continue; }
+    if (v === undefined) continue;
+    const value = /password|token|secret|^env$/i.test(k) ? '[REDACTED]' : scrub(v);
     let s;
-    if (typeof v === 'string') s = v;
-    else { try { s = JSON.stringify(v); } catch (_) { s = String(v); } }
+    if (typeof value === 'string') s = value;
+    else { try { s = JSON.stringify(value); } catch (_) { s = String(value); } }
     out[k] = s.length > 40 ? s.slice(0, 40) + '…' : s;
   }
   return out;
@@ -2410,8 +2474,8 @@ function confirmRequiredSet() {
     .split(',').map(s => s.trim()).filter(Boolean));
 }
 
-async function requireConfirm(name, args, describe) {
-  if (!confirmRequiredSet().has(name)) return;
+async function requireConfirm(name, args, describe, force = false) {
+  if (!force && !confirmRequiredSet().has(name)) return;
   if (args.confirm === true) return;
   const targets = typeof describe === 'function' ? await describe() : describe;
   const err = new Error(`Confirmation required: ${name} would affect ${targets}. Re-run with confirm: true to proceed.`);
@@ -2501,7 +2565,7 @@ function confirmIntercept(name, args) {
 // undo it. Refuse
 // those calls when the target resolves to our own container. Runs BEFORE the
 // confirm-token flow so a refusal never burns a token.
-const SELF_GUARD_TOOLS = new Set(['docker_remove', 'docker_rename', 'docker_container_recreate']);
+const SELF_GUARD_TOOLS = new Set(['docker_remove', 'docker_rename', 'docker_container_recreate', 'docker_stop']);
 
 let selfContainerIdPromise = null;
 function selfContainerId() {
@@ -2566,7 +2630,16 @@ async function callToolLogged(name, args, agent, key) {
 }
 
 const app = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  // A malformed Host header (e.g. a space) makes new URL() throw before auth;
+  // without this the async handler's rejection leaves the request hanging.
+  let url;
+  try {
+    url = new URL(req.url, `http://${req.headers.host}`);
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Bad Host header' }));
+    return;
+  }
 
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
@@ -2740,8 +2813,11 @@ const app = http.createServer(async (req, res) => {
   if (url.pathname === '/run' && req.method === 'POST') {
     const body = await readBody(req, res).catch(() => null);
     if (body === null) return;
+    const started = Date.now();
+    let auditArgs;
     try {
       const { image, cmd, name, ports, env } = JSON.parse(body);
+      auditArgs = { image, cmd, name, ports, env };
       await pullImage(image);
       const container = await docker.createContainer({
         Image: image, Cmd: cmd, name,
@@ -2752,9 +2828,11 @@ const app = http.createServer(async (req, res) => {
         Env: env ? Object.entries(env).map(([k, v]) => `${k}=${v}`) : undefined
       });
       await container.start();
+      auditCall({ key: req.keyFp, agent: req.agentName, tool: 'docker_run', args: auditArgs, ok: true, duration_ms: Date.now() - started });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ id: container.id, status: 'started' }));
     } catch (err) {
+      auditCall({ key: req.keyFp, agent: req.agentName, tool: 'docker_run', args: auditArgs, ok: false, error: err.message, duration_ms: Date.now() - started });
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
     }
@@ -2765,8 +2843,17 @@ const app = http.createServer(async (req, res) => {
     const body = await readBody(req, res).catch(() => null);
     if (body === null) return;
     try {
-      const { id } = JSON.parse(body);
-      await docker.getContainer(id).stop();
+      const args = JSON.parse(body);
+      const { id } = args;
+      // Route through callToolLogged so /stop gets the same self-guard and
+      // audit entry as the docker_stop MCP tool. Pass the full body so a
+      // confirm_token is forwarded too.
+      const result = await callToolLogged('docker_stop', args, req.agentName, req.keyFp);
+      if (result?.structuredContent?.confirm_required) {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result.structuredContent));
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ stopped: id }));
     } catch (err) {
@@ -2836,23 +2923,32 @@ function setupLogWebSocket(server) {
     const containerId = ws._containerId;
     if (!containerId) { ws.close(1008); return; }
     console.log(`WebSocket log stream: ${containerId}`);
+    let stream = null;
+    let closed = false;
+    // Attach before logs() resolves: a client that disconnects while the
+    // daemon is still opening the stream must not leave it running forever.
+    ws.on('close', () => { closed = true; if (stream) stream.destroy(); });
     docker.getContainer(containerId).logs({ follow: true, stdout: true, stderr: true, tail: 100 })
-      .then(stream => {
+      .then(s => {
+        stream = s;
+        if (closed) { stream.destroy(); return; }
         const out = new PassThrough();
         const err = new PassThrough();
         out.on('data', chunk => ws.send(chunk.toString()));
         err.on('data', chunk => ws.send(chunk.toString()));
         docker.modem.demuxStream(stream, out, err);
         stream.on('error', e => { ws.send(`Error: ${e.message}`); ws.close(); });
-        ws.on('close', () => stream.destroy());
       })
-      .catch(e => { ws.send(`Error: ${e.message}`); ws.close(); });
+      .catch(e => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(`Error: ${e.message}`);
+        ws.close();
+      });
   });
 
   return { wss };
 }
 
-module.exports = { app, handleMCPTool, callToolLogged, sendMCPResponse, MCP_TOOLS, sessions, sweepSessions, parseApiKeys, RECREATE_LOCKS, REGISTRY_AUTH, setupLogWebSocket, setSelfContainerIdForTests };
+module.exports = { app, handleMCPTool, callToolLogged, sendMCPResponse, MCP_TOOLS, sessions, sweepSessions, parseApiKeys, summarizeArgs, RECREATE_LOCKS, REGISTRY_AUTH, setupLogWebSocket, setSelfContainerIdForTests };
 
 if (require.main === module) {
   const PORT = process.env.PORT || 3001;

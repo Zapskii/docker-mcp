@@ -48,14 +48,16 @@ curl -s -X POST http://localhost:3001/mcp \
 | Env var | Default | Meaning |
 |---|---|---|
 | `PORT` | `3001` | Listen port |
-| `AUDIT_LOG` | `/app/audit.jsonl` | Path of the JSONL audit file for `tools/call`, or `off`. Secrets are redacted and keys are fingerprinted. |
+| `AUDIT_LOG` | `/app/audit.jsonl` | Path of the JSONL audit file for tool calls (including the legacy REST `/run` and `/stop` routes), or `off`. Secrets are redacted and keys are fingerprinted. |
 | `AUDIT_READ_TOOLS` | unset | Set to `1` to audit read-only tools as well as mutating ones |
 | `CONFIRM_TOOLS` | unset | Comma-separated tools that need a two-phase call: the first call returns a single-use `confirm_token` bound to its args |
 | `CONFIRM_TTL_S` | `60` | Lifetime of a confirm token, in seconds |
 | `CONFIRM_REQUIRED_TOOLS` | `docker_image_rm,docker_volume_rm,docker_network_rm,docker_compose_down` | Tools that require `confirm: true`, or `off` |
 | `LOG_MAX_BYTES` | `65536` | Cap on the size of a `docker_logs` response |
 
-The server refuses to remove, rename or recreate its own container.
+`docker_image_prune` with `all: true` also requires `confirm: true` — it removes every unused image, not just dangling ones. Use `dry_run: true` to preview first.
+
+The server refuses to stop, remove, rename or recreate its own container.
 
 ## Tests
 
