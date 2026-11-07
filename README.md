@@ -51,7 +51,9 @@ Then check `curl http://<docker-host>:3001/health`. See [docs/SETUP.md](docs/SET
 ## Security model
 
 - **API key on every request** (`X-API-Key`). The server refuses to start without
-  at least one `API_KEY` or `API_KEY_<AGENT>` variable.
+  at least one `API_KEY` or `API_KEY_<AGENT>` variable. Keys are read from the
+  container environment at startup into memory — the server stores no key file
+  or database. See [docs/SETUP.md](docs/SETUP.md#3-create-api-keys).
 - **Named agents in the audit trail.** `API_KEY_<AGENT>` records the lowercased
   agent name on every audit line, so a shared host still shows who did what.
 - **Self-guard.** The server refuses to stop, remove, rename or recreate its own
@@ -60,8 +62,8 @@ Then check `curl http://<docker-host>:3001/health`. See [docs/SETUP.md](docs/SET
   more with `CONFIRM_TOOLS`/`CONFIRM_REQUIRED_TOOLS`. `docker_image_prune` with
   `all: true` always requires `confirm: true`.
 - **Audit log.** JSONL for mutating calls (including legacy REST `/run` and
-  `/stop`), with secrets redacted and keys fingerprinted. Set `AUDIT_LOG=off` to
-  disable.
+  `/stop`), with secrets redacted and keys shown only as a masked
+  `first4…last4`. Set `AUDIT_LOG=off` to disable.
 - **Read-only stacks mount.** Bind-mount compose directories read-only (`:ro`)
   and give `docker_copy` a separate writable transfer directory only.
 
@@ -70,7 +72,7 @@ Then check `curl http://<docker-host>:3001/health`. See [docs/SETUP.md](docs/SET
 | Env var | Default | Meaning |
 |---|---|---|
 | `PORT` | `3001` | Listen port |
-| `API_KEY` / `API_KEY_<AGENT>` | — | Required API keys; the suffix names the agent |
+| `API_KEY` / `API_KEY_<AGENT>` | — | Required API keys, read at startup; the suffix names the agent |
 | `AUDIT_LOG` | `/app/audit.jsonl` | JSONL audit file for mutating tool calls, or `off` |
 | `AUDIT_READ_TOOLS` | unset | `1` also audits read-only tools |
 | `CONFIRM_TOOLS` | unset | Two-phase token flow for comma-separated tools |

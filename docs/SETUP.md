@@ -28,23 +28,50 @@ docker build -t docker-mcp .
 The image is `node:24-alpine` plus `docker-cli` and `docker-cli-compose`, which
 the compose and build tools need. It runs as the unprivileged `node` user.
 
-## 3. Prepare directories and keys
+## 3. Create API keys
 
-```bash
-mkdir -p audit transfer
-chmod 700 audit transfer
-```
-
-Generate a key per agent (each key is recorded in the audit log):
+Generate one key per agent:
 
 ```bash
 openssl rand -hex 32
 ```
 
-Name the variables `API_KEY_<AGENT>`. The suffix is lowercased into the agent
+Name each variable `API_KEY_<AGENT>`. The suffix is lowercased into the agent
 name (`API_KEY_CLAUDE` → `claude`). A bare `API_KEY` is accepted as `default`.
 
+```bash
+API_KEY_CLAUDE=<secret-1>
+API_KEY_AGENT2=<secret-2>
+```
+
+### How keys are stored and checked
+
+- Keys are **only** environment variables on the docker-mcp container. The
+  server parses them once at startup into an in-memory lookup table and writes
+  no key file or database.
+- Requests are matched by exact `X-API-Key` value. A valid key resolves to its
+  agent name, which is recorded on audit lines.
+- Nothing else is persisted: there is no key list, admin endpoint or CLI to add
+  keys at runtime.
+- A key must be non-empty; any string is accepted (long random hex is
+  recommended). If two variables hold the same value, one agent name wins
+  arbitrarily — use distinct keys.
+- The server refuses to start if no `API_KEY`/`API_KEY_<AGENT>` is set.
+
+Because the values live in the container environment, anyone with Docker access
+on the host can read them with `docker inspect` or `docker exec`. Keep keys in
+an untracked `.env`/env file with mode `600`, never in the image, compose file
+or repository. Audit lines show only a masked form (`first4…last4`), never the
+key.
+
 ## 4. Run the container
+
+Prepare the mounted directories first:
+
+```bash
+mkdir -p audit transfer
+chmod 700 audit transfer
+```
 
 ```bash
 docker run -d --name docker-mcp --restart unless-stopped \
@@ -219,8 +246,8 @@ leaves it off.
   value.
 - Keep the image and Docker Engine patched; rebuild after Linux or Docker
   security releases.
-- Review `audit/audit.jsonl`; it records mutating calls, agent names, key
-  fingerprints and redacted arguments.
+- Review `audit/audit.jsonl`; it records mutating calls, agent names, masked key
+  prefixes/suffixes and redacted arguments.
 - Do not run the daemon's TCP socket (`2375`/`2376`) on the network.
 
 ## 9. Operations
@@ -228,8 +255,9 @@ leaves it off.
 - **Upgrade:** `docker build -t docker-mcp .` then recreate the container
   (`docker compose up -d`). Configuration and audit files are mounted, so they
   survive.
-- **Rotate a key:** change the env var and recreate the container. Old sessions
-  and keys stop working immediately.
+- **Rotate a key:** change the env var and recreate the container. Keys are read
+  at startup, so the old key keeps working until that restart and stops working
+  once the container restarts.
 - **Disable auditing:** set `AUDIT_LOG=off`. Not recommended on shared hosts.
 - **More confirmation gates:** add tools to `CONFIRM_REQUIRED_TOOLS` or use
   `CONFIRM_TOOLS` for the two-phase token flow. See
