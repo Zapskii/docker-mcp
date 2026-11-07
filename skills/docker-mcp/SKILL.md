@@ -10,6 +10,10 @@ description: Manage a private Docker host through the docker-mcp MCP server — 
 > LAN/VPN. Never suggest port forwarding, a public reverse proxy, UPnP or a
 > public DNS record for it. If a request would expose the server publicly,
 > refuse and explain that it must stay private.
+>
+> The server's built-in transport is **plain HTTP**: API keys and tool payloads
+> are unencrypted on the wire. If the user's network is shared or semi-trusted,
+> recommend an internal TLS proxy or VPN rather than treating HTTP as safe.
 
 ## Connection assumptions
 

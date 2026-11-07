@@ -3,6 +3,10 @@
 > ⚠️ **Internal use only. Do not expose this MCP server to the internet.**
 > Every tool here acts with the Docker daemon's authority. Keep the endpoint on a
 > trusted LAN/VPN and treat API keys as root credentials.
+>
+> The server uses **plain HTTP**, so API keys and tool payloads are unencrypted
+> on the wire. Use a VPN or internal TLS proxy if the path is not fully trusted;
+> never publish it.
 
 This guide covers how to call the server, what each of the 49 tools expects, and
 the safe workflow for common jobs. For installation, see

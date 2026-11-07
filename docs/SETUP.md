@@ -4,6 +4,11 @@
 > It controls the Docker socket. A reachable API key is root-equivalent access to
 > the host. Use a trusted LAN, VPN or loopback only — no public DNS, port
 > forwarding, UPnP or public reverse proxy.
+>
+> The server speaks **plain HTTP**. API keys and tool payloads cross the network
+> unencrypted. On a shared or semi-trusted path, terminate TLS at an internal
+> proxy or route through a VPN; do not treat HTTP as safe just because the
+> network is "internal".
 
 ## 1. Requirements
 
@@ -234,6 +239,10 @@ leaves it off.
 
 ## 8. Network hardening checklist
 
+- **Assume HTTP traffic is readable.** The server has no built-in TLS; API keys
+  and tool payloads can be captured by anyone in the network path (ARP spoofing,
+  compromised host, shared Wi-Fi, mirror port). Use a VPN or internal TLS proxy
+  unless the host and every client are on an isolated segment.
 - Bind the port to a private interface or restrict it with the host firewall to
   known agent IPs. `-p 3001:3001` listens on all interfaces.
 - Never publish the port on a router, never enable UPnP, never add a public DNS

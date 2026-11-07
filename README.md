@@ -6,6 +6,10 @@
 > the host. Anyone who can reach it with a valid API key has root-equivalent
 > control. Run it only on a trusted private network (LAN, VPN or a single host),
 > never with public DNS, port forwarding, UPnP or a public reverse proxy.
+>
+> The built-in server uses **plain HTTP** — API keys and tool payloads are
+> unencrypted on the wire. If the network path is shared or semi-trusted, put it
+> behind an internal TLS proxy or VPN. TLS does not make internet exposure safe.
 
 A single-file [Model Context Protocol](https://modelcontextprotocol.io) server that lets AI agents manage a Docker host over JSON-RPC 2.0. It exposes **49 tools** covering containers, images, volumes, networks, compose stacks, async jobs, events and registry auth.
 
