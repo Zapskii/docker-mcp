@@ -1237,7 +1237,10 @@ async function recreateContainerLocked(args, job, signal, old, info, name) {
   // Docker's default health interval is 30s, so a 30s deadline can expire
   // before the first status is reported — allow two intervals by default.
   const hcIntervalS = (info.Config.Healthcheck?.Interval || 30e9) / 1e9;
-  const startTimeoutS = args.start_timeout_s ?? (hasHealthcheck ? Math.ceil(hcIntervalS * 2) : 30);
+  // Clamp caller/metadata-derived timeouts so a bad Interval can't pin the
+  // recreate (and its lock) open for hours.
+  const startTimeoutS = Math.min(Math.max(
+    Number(args.start_timeout_s) || (hasHealthcheck ? Math.ceil(hcIntervalS * 2) : 30), 1), 600);
   const backupName = args.backup_name || `${name}-old`;
   const wasRunning = Boolean(info.State?.Running);
 
@@ -1800,6 +1803,8 @@ async function handleMCPTool(name, args) {
           would_remove: images.map(i => ({ id: i.Id, tags: i.RepoTags || [] }))
         });
       }
+      // all:true removes every unused image, not just dangling ones — gate it
+      await requireConfirm('docker_image_prune', args, 'all unused images', args.all === true);
       if (Object.keys(f).length > 0) {
         const images = await resolveCandidates();
         const deleted = [];
@@ -2362,7 +2367,7 @@ function summarizeArgs(args) {
   const out = {};
   for (const [k, v] of Object.entries(args || {})) {
     if (v === undefined) continue;
-    if (/password|token|secret/i.test(k)) { out[k] = '[REDACTED]'; continue; }
+    if (/password|token|secret|^env$/i.test(k)) { out[k] = '[REDACTED]'; continue; }
     let s;
     if (typeof v === 'string') s = v;
     else { try { s = JSON.stringify(v); } catch (_) { s = String(v); } }
@@ -2448,8 +2453,8 @@ function confirmRequiredSet() {
     .split(',').map(s => s.trim()).filter(Boolean));
 }
 
-async function requireConfirm(name, args, describe) {
-  if (!confirmRequiredSet().has(name)) return;
+async function requireConfirm(name, args, describe, force = false) {
+  if (!force && !confirmRequiredSet().has(name)) return;
   if (args.confirm === true) return;
   const targets = typeof describe === 'function' ? await describe() : describe;
   const err = new Error(`Confirmation required: ${name} would affect ${targets}. Re-run with confirm: true to proceed.`);
@@ -2820,7 +2825,12 @@ const app = http.createServer(async (req, res) => {
       const { id } = JSON.parse(body);
       // Route through callToolLogged so /stop gets the same self-guard and
       // audit entry as the docker_stop MCP tool.
-      await callToolLogged('docker_stop', { id }, req.agentName, req.keyFp);
+      const result = await callToolLogged('docker_stop', { id }, req.agentName, req.keyFp);
+      if (result?.structuredContent?.confirm_required) {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result.structuredContent));
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ stopped: id }));
     } catch (err) {

@@ -26,10 +26,18 @@ describe('docker_image_prune', () => {
   });
 
   it('prunes all unused images when all=true', async () => {
-    await handleMCPTool('docker_image_prune', { all: true });
+    await handleMCPTool('docker_image_prune', { all: true, confirm: true });
     expect(mockDocker.pruneImages).toHaveBeenCalledWith(
       { filters: { dangling: ['false'] } }
     );
+  });
+
+  it('requires confirm:true for all=true, but not for a dry run', async () => {
+    await expect(handleMCPTool('docker_image_prune', { all: true }))
+      .rejects.toThrow(/Confirmation required/);
+    expect(mockDocker.pruneImages).not.toHaveBeenCalled();
+    const dry = await handleMCPTool('docker_image_prune', { all: true, dry_run: true });
+    expect(JSON.parse(dry.content[0].text).dry_run).toBe(true);
   });
 });
 

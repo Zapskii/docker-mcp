@@ -313,6 +313,20 @@ describe('JSONL audit log', () => {
     expect(readLines().map(l => l.tool).sort()).toEqual(['docker_run', 'docker_stop']);
   });
 
+  it('redacts docker_run env values in the audit log', async () => {
+    const mockDocker = require('dockerode').mock.results[0].value;
+    mockDocker.pull.mockImplementationOnce((...args) => {
+      args[args.length - 1](null, { on: () => {}, destroy: () => {} });
+    });
+    mockDocker.modem.followProgress.mockImplementationOnce((stream, cb) => cb(null, []));
+
+    const run = await request(app).post('/run').set(AUTH)
+      .send({ image: 'nginx:latest', env: { DB_PASSWORD: 'supersecret123' } });
+    expect(run.status).toBe(200);
+    expect(readLines()[0].args.env).toBe('[REDACTED]');
+    expect(fs.readFileSync(auditPath, 'utf8')).not.toContain('supersecret123');
+  });
+
   it('preserves a multibyte UTF-8 character split across request chunks', async () => {
     const http = require('http');
     const body = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call',
@@ -554,5 +568,17 @@ describe('REST /run registry credentials', () => {
     } finally {
       REGISTRY_AUTH.clear();
     }
+  });
+});
+
+describe('REST /stop confirm gate', () => {
+  afterEach(() => { delete process.env.CONFIRM_TOOLS; });
+
+  it('returns 409 with the confirm token instead of a false success', async () => {
+    process.env.CONFIRM_TOOLS = 'docker_stop';
+    const res = await request(app).post('/stop').set(AUTH).send({ id: 'abc' });
+    expect(res.status).toBe(409);
+    expect(res.body.confirm_required).toBe(true);
+    expect(res.body.confirm_token).toBeTruthy();
   });
 });
