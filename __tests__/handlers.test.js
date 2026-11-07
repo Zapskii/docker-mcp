@@ -1264,6 +1264,45 @@ describe('docker_container_recreate', () => {
     expect(data.backup_name).toBe('web-old');
   });
 
+  it('rolls back promptly when an async recreate is cancelled', async () => {
+    const healthInfo = {
+      ...oldInfo,
+      Config: { ...oldInfo.Config, Healthcheck: { Test: ['CMD', 'true'], Interval: 30e9 } }
+    };
+    const oldC = makeOld(healthInfo);
+    const newC = {
+      start: jest.fn().mockResolvedValue({}),
+      remove: jest.fn().mockResolvedValue({}),
+      inspect: jest.fn().mockResolvedValue({
+        Id: 'new4567890123', State: { Running: true, Health: { Status: 'starting' } }
+      })
+    };
+    mockDocker.getContainer.mockReturnValue(oldC);
+    mockDocker.createContainer.mockResolvedValueOnce(newC);
+
+    const started = JSON.parse((await handleMCPTool('docker_container_recreate', {
+      id: 'web', mode: 'async', start_timeout_s: 2
+    })).content[0].text);
+    const status = async () => JSON.parse(
+      (await handleMCPTool('docker_job_status', { job_id: started.job_id })).content[0].text);
+
+    let st;
+    for (let i = 0; i < 100; i++) {
+      st = await status();
+      if (st.progress.some(l => l.includes('Started replacement'))) break;
+      await new Promise(r => setTimeout(r, 20));
+    }
+    await handleMCPTool('docker_job_cancel', { job_id: started.job_id });
+    for (let i = 0; i < 150 && st.status === 'running'; i++) {
+      await new Promise(r => setTimeout(r, 20));
+      st = await status();
+    }
+
+    expect(st.status).toBe('done');
+    expect(st.progress.join('\n')).toMatch(/cancelled/i);
+    expect(newC.remove).toHaveBeenCalled();
+  });
+
   describe('network re-attachment', () => {
     const multiInfo = {
       ...oldInfo,

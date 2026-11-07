@@ -1296,6 +1296,10 @@ async function recreateContainerLocked(args, job, signal, old, info, name) {
   let exitInfo = null;
   let healthy = false;
   while (Date.now() < deadline) {
+    if (signal?.aborted) {
+      job?.log('Recreate cancelled — rolling back');
+      return await recreateRollback(old, name, newContainer, new Error('cancelled'), backupName, wasRunning);
+    }
     await sleep(1000);
     const st = await newContainer.inspect();
     if (!st.State.Running) { exitInfo = st; break; }
