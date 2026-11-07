@@ -2275,14 +2275,19 @@ describe('v2.13.3: self-guard on the server\'s own container', () => {
     }
   });
 
+  it('docker_stop refuses to stop the server\'s own container', async () => {
+    await expect(callToolLogged('docker_stop', { id: 'self-container' }, 't', 'k'))
+      .rejects.toThrow(/own container/);
+  });
+
   it('non-guarded tools are unaffected even when the target looks like self', async () => {
-    const stop = jest.fn().mockResolvedValue({});
+    const start = jest.fn().mockResolvedValue({});
     mockDocker.getContainer.mockImplementation((id) => {
       const isSelf = id === 'self-container';
-      return { inspect: jest.fn().mockResolvedValue({ Id: isSelf ? SELF_ID : 'target-full-id' }), stop };
+      return { inspect: jest.fn().mockResolvedValue({ Id: isSelf ? SELF_ID : 'target-full-id' }), start };
     });
-    await handleMCPTool('docker_stop', { id: 'self-container' });
-    expect(stop).toHaveBeenCalled();
+    await handleMCPTool('docker_start', { id: 'self-container' });
+    expect(start).toHaveBeenCalled();
   });
 });
 

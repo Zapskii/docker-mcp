@@ -2257,7 +2257,7 @@ const MAX_BODY = 1_048_576; // 1 MB
 
 function readBody(req, res) {
   return new Promise((resolve, reject) => {
-    let body = '';
+    const chunks = [];
     let size = 0;
     req.on('data', chunk => {
       size += chunk.length;
@@ -2268,9 +2268,11 @@ function readBody(req, res) {
         reject(new Error('body too large'));
         return;
       }
-      body += chunk;
+      chunks.push(chunk);
     });
-    req.on('end', () => resolve(body));
+    // Decode once over the whole body: toString() per chunk corrupts a
+    // multibyte UTF-8 char split across TCP chunks.
+    req.on('end', () => resolve(Buffer.concat(chunks).toString()));
     req.on('error', reject);
   });
 }
@@ -2304,10 +2306,10 @@ const fs = require('fs');
 
 const MUTATING_TOOLS = new Set([
   'docker_run', 'docker_stop', 'docker_remove', 'docker_start', 'docker_restart',
-  'docker_rename', 'docker_container_update', 'docker_exec',
+  'docker_rename', 'docker_container_update', 'docker_exec', 'docker_copy',
   'docker_pull', 'docker_build', 'docker_image_rm', 'docker_image_tag',
   'docker_image_prune', 'docker_container_prune',
-  'docker_volume_create', 'docker_volume_rm', 'docker_volume_backup',
+  'docker_volume_create', 'docker_volume_rm', 'docker_volume_backup', 'docker_volume_restore',
   'docker_network_create', 'docker_network_rm', 'docker_network_connect', 'docker_network_disconnect',
   'docker_compose_up', 'docker_compose_down', 'docker_compose_build',
   'docker_compose_pull', 'docker_compose_restart',
@@ -2324,6 +2326,7 @@ function keyFingerprint(key) {
 function summarizeArgs(args) {
   const out = {};
   for (const [k, v] of Object.entries(args || {})) {
+    if (v === undefined) continue;
     if (/password|token|secret/i.test(k)) { out[k] = '[REDACTED]'; continue; }
     let s;
     if (typeof v === 'string') s = v;
@@ -2501,7 +2504,7 @@ function confirmIntercept(name, args) {
 // undo it. Refuse
 // those calls when the target resolves to our own container. Runs BEFORE the
 // confirm-token flow so a refusal never burns a token.
-const SELF_GUARD_TOOLS = new Set(['docker_remove', 'docker_rename', 'docker_container_recreate']);
+const SELF_GUARD_TOOLS = new Set(['docker_remove', 'docker_rename', 'docker_container_recreate', 'docker_stop']);
 
 let selfContainerIdPromise = null;
 function selfContainerId() {
@@ -2566,7 +2569,16 @@ async function callToolLogged(name, args, agent, key) {
 }
 
 const app = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  // A malformed Host header (e.g. a space) makes new URL() throw before auth;
+  // without this the async handler's rejection leaves the request hanging.
+  let url;
+  try {
+    url = new URL(req.url, `http://${req.headers.host}`);
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Bad Host header' }));
+    return;
+  }
 
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
@@ -2740,8 +2752,11 @@ const app = http.createServer(async (req, res) => {
   if (url.pathname === '/run' && req.method === 'POST') {
     const body = await readBody(req, res).catch(() => null);
     if (body === null) return;
+    const started = Date.now();
+    let auditArgs;
     try {
       const { image, cmd, name, ports, env } = JSON.parse(body);
+      auditArgs = { image, cmd, name, ports, env };
       await pullImage(image);
       const container = await docker.createContainer({
         Image: image, Cmd: cmd, name,
@@ -2752,9 +2767,11 @@ const app = http.createServer(async (req, res) => {
         Env: env ? Object.entries(env).map(([k, v]) => `${k}=${v}`) : undefined
       });
       await container.start();
+      auditCall({ key: req.keyFp, agent: req.agentName, tool: 'docker_run', args: auditArgs, ok: true, duration_ms: Date.now() - started });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ id: container.id, status: 'started' }));
     } catch (err) {
+      auditCall({ key: req.keyFp, agent: req.agentName, tool: 'docker_run', args: auditArgs, ok: false, error: err.message, duration_ms: Date.now() - started });
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
     }
@@ -2766,7 +2783,9 @@ const app = http.createServer(async (req, res) => {
     if (body === null) return;
     try {
       const { id } = JSON.parse(body);
-      await docker.getContainer(id).stop();
+      // Route through callToolLogged so /stop gets the same self-guard and
+      // audit entry as the docker_stop MCP tool.
+      await callToolLogged('docker_stop', { id }, req.agentName, req.keyFp);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ stopped: id }));
     } catch (err) {
@@ -2836,17 +2855,26 @@ function setupLogWebSocket(server) {
     const containerId = ws._containerId;
     if (!containerId) { ws.close(1008); return; }
     console.log(`WebSocket log stream: ${containerId}`);
+    let stream = null;
+    let closed = false;
+    // Attach before logs() resolves: a client that disconnects while the
+    // daemon is still opening the stream must not leave it running forever.
+    ws.on('close', () => { closed = true; if (stream) stream.destroy(); });
     docker.getContainer(containerId).logs({ follow: true, stdout: true, stderr: true, tail: 100 })
-      .then(stream => {
+      .then(s => {
+        stream = s;
+        if (closed) { stream.destroy(); return; }
         const out = new PassThrough();
         const err = new PassThrough();
         out.on('data', chunk => ws.send(chunk.toString()));
         err.on('data', chunk => ws.send(chunk.toString()));
         docker.modem.demuxStream(stream, out, err);
         stream.on('error', e => { ws.send(`Error: ${e.message}`); ws.close(); });
-        ws.on('close', () => stream.destroy());
       })
-      .catch(e => { ws.send(`Error: ${e.message}`); ws.close(); });
+      .catch(e => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(`Error: ${e.message}`);
+        ws.close();
+      });
   });
 
   return { wss };
