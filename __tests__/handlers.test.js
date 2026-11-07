@@ -1293,6 +1293,25 @@ describe('docker_container_recreate', () => {
       });
     });
 
+    it('preserves the primary network aliases and static IP via NetworkingConfig', async () => {
+      const info = {
+        ...oldInfo,
+        HostConfig: { ...oldInfo.HostConfig, NetworkMode: 'app-net' },
+        NetworkSettings: { Networks: {
+          'app-net': { Aliases: ['cache', 'web'], IPAMConfig: { IPv4Address: '10.99.0.9' } }
+        } }
+      };
+
+      await recreate(makeOld(info), stubNew());
+
+      expect(mockDocker.createContainer).toHaveBeenCalledWith(expect.objectContaining({
+        NetworkingConfig: { EndpointsConfig: {
+          'app-net': { Aliases: ['cache', 'web'], IPAMConfig: { IPv4Address: '10.99.0.9' } }
+        } }
+      }));
+      expect(mockDocker.getNetwork).not.toHaveBeenCalled(); // primary is not double-attached
+    });
+
     it('does not re-attach a network already covered by NetworkMode', async () => {
       const info = {
         ...oldInfo,
@@ -1322,6 +1341,23 @@ describe('docker_container_recreate', () => {
       expect(newC.start).not.toHaveBeenCalled();   // never started without its network
       expect(oldC.start).toHaveBeenCalled();       // previous container back up
     });
+  });
+
+  it('does not stop an already-stopped container, nor restart it on rollback', async () => {
+    const oldC = makeOld({ ...oldInfo, State: { Running: false } });
+    const newC = {
+      start:  jest.fn().mockRejectedValue(new Error('port already allocated')),
+      remove: jest.fn().mockResolvedValue({})
+    };
+    mockDocker.getContainer.mockReturnValueOnce(oldC).mockReturnValueOnce(oldC);
+    mockDocker.createContainer.mockResolvedValueOnce(newC);
+
+    const result = await handleMCPTool('docker_container_recreate', { id: 'web', start_timeout_s: 5 });
+    const data = JSON.parse(result.content[0].text);
+
+    expect(data.rolled_back).toBe(true);
+    expect(oldC.stop).not.toHaveBeenCalled();
+    expect(oldC.start).not.toHaveBeenCalled();
   });
 
   it('pulls the image before recreating by default', async () => {
@@ -1470,6 +1506,48 @@ describe('docker_container_recreate', () => {
       expect(oldC.start).toHaveBeenCalled();
     });
 
+    it('treats Test NONE as no healthcheck', async () => {
+      const info = { ...oldInfo, Config: { ...oldInfo.Config, Healthcheck: { Test: ['NONE'] } } };
+      const oldC = makeOld(info);
+      const newC = {
+        start:  jest.fn().mockResolvedValue({}),
+        remove: jest.fn().mockResolvedValue({}),
+        inspect: jest.fn().mockResolvedValue({ Id: 'new4567890123', State: { Running: true } })
+      };
+      mockDocker.getContainer.mockReturnValueOnce(oldC).mockReturnValueOnce(oldC);
+      mockDocker.createContainer.mockResolvedValueOnce(newC);
+
+      const result = await handleMCPTool('docker_container_recreate', { id: 'web', start_timeout_s: 5 });
+      const data = JSON.parse(result.content[0].text);
+
+      expect(data.recreated).toBe(true);
+      expect(data.health).toBeUndefined();
+      expect(oldC.start).not.toHaveBeenCalled();
+    });
+
+    it('derives the default timeout from the healthcheck interval', async () => {
+      const info = {
+        ...oldInfo,
+        Config: { ...oldInfo.Config, Healthcheck: { Test: ['CMD', 'true'], Interval: 1e9 } }
+      };
+      const oldC = makeOld(info);
+      const newC = {
+        start:  jest.fn().mockResolvedValue({}),
+        remove: jest.fn().mockResolvedValue({}),
+        inspect: jest.fn().mockResolvedValue({
+          Id: 'new4567890123', State: { Running: true, Health: { Status: 'unhealthy' } }
+        })
+      };
+      mockDocker.getContainer.mockReturnValueOnce(oldC).mockReturnValueOnce(oldC);
+      mockDocker.createContainer.mockResolvedValueOnce(newC);
+
+      // no start_timeout_s: two intervals (2s), not the old flat 30s
+      const result = await handleMCPTool('docker_container_recreate', { id: 'web' });
+      const data = JSON.parse(result.content[0].text);
+      expect(data.rolled_back).toBe(true);
+      expect(data.error).toMatch(/within 2s/);
+    });
+
     it('keeps the run-watching behavior for containers without a healthcheck', async () => {
       const oldC = makeOld();
       const newC = {
@@ -1548,6 +1626,30 @@ describe('per-container recreate lock', () => {
     const result = await handleMCPTool('docker_container_recreate', { id: 'web', start_timeout_s: 3 });
     expect(JSON.parse(result.content[0].text).rolled_back).toBe(true);
     expect(RECREATE_LOCKS.has('web')).toBe(false);
+  });
+
+  it('does not release a lock taken over by another caller', async () => {
+    const foreign = { ts: Date.now(), token: 'foreign' };
+    const oldC = {
+      inspect: jest.fn().mockResolvedValue({
+        Id: 'old1234567890', Name: '/web',
+        Config: { Image: 'nginx:latest' }, HostConfig: {}, NetworkingConfig: {},
+        State: { Running: true }
+      }),
+      stop: jest.fn().mockResolvedValue({}),
+      rename: jest.fn().mockResolvedValue({})
+    };
+    mockDocker.getContainer.mockReturnValueOnce(oldC).mockReturnValueOnce(oldC);
+    mockDocker.createContainer.mockResolvedValueOnce({
+      start: jest.fn().mockImplementation(async () => {
+        RECREATE_LOCKS.set('web', foreign); // another caller took over mid-run
+      }),
+      inspect: jest.fn().mockResolvedValue({ Id: 'new123', State: { Running: true } })
+    });
+
+    await handleMCPTool('docker_container_recreate', { id: 'web', start_timeout_s: 3 });
+
+    expect(RECREATE_LOCKS.get('web')).toBe(foreign);
   });
 
   it('takes over a lock older than the 5 minute TTL', async () => {
